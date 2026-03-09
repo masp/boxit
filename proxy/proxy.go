@@ -73,6 +73,18 @@ func (p *Proxy) Stop() error {
 	return nil
 }
 
+// ProxyEnvVars returns environment variables that configure tools to use
+// the proxy via explicit http_proxy/https_proxy variables.
+func ProxyEnvVars(port int) []string {
+	proxyURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	return []string{
+		"http_proxy=" + proxyURL,
+		"https_proxy=" + proxyURL,
+		"HTTP_PROXY=" + proxyURL,
+		"HTTPS_PROXY=" + proxyURL,
+	}
+}
+
 func freePort() (int, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

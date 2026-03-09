@@ -68,8 +68,13 @@ func RunWithOptions(opts Options) error {
 		if err != nil {
 			return fmt.Errorf("sandbox: %w", err)
 		}
-		// Wrap with sudo -u <user> to run as the temp user
+		// Wrap with sudo -u <user> to run as the temp user.
+		// Use 'env' to pass extra env vars since sudo resets the environment.
 		sudoArgs := []string{"-u", username, "--"}
+		if len(opts.ExtraEnv) > 0 {
+			sudoArgs = append(sudoArgs, "env")
+			sudoArgs = append(sudoArgs, opts.ExtraEnv...)
+		}
 		sudoArgs = append(sudoArgs, sandboxExec)
 		sudoArgs = append(sudoArgs, sandboxArgs...)
 		cmd = exec.Command("sudo", sudoArgs...)
@@ -82,12 +87,8 @@ func RunWithOptions(opts Options) error {
 	cmd.Stderr = os.Stderr
 	cmd.Dir = cwd
 
-	if opts.RunAsUID > 0 && len(opts.ExtraEnv) > 0 {
-		// When running as another user via sudo, we need to pass env vars explicitly.
-		// Build a clean environment with the extras.
-		env := os.Environ()
-		env = append(env, opts.ExtraEnv...)
-		cmd.Env = env
+	if len(opts.ExtraEnv) > 0 && opts.RunAsUID == 0 {
+		cmd.Env = append(os.Environ(), opts.ExtraEnv...)
 	}
 
 	return cmd.Run()

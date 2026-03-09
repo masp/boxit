@@ -8,6 +8,7 @@ import (
 
 	"github.com/masp/boxit/profile"
 	"github.com/masp/boxit/sandbox"
+	"github.com/masp/boxit/userutil"
 )
 
 func main() {
@@ -22,6 +23,14 @@ func main() {
 	if len(args) < 1 {
 		flag.Usage()
 		os.Exit(1)
+	}
+
+	if args[0] == "daemon" {
+		if err := userutil.RunDaemon(); err != nil {
+			fmt.Fprintf(os.Stderr, "boxit daemon: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	cwd, err := os.Getwd()
@@ -42,14 +51,14 @@ func main() {
 		prof = profile.Default()
 	}
 
-	// Use proxy mode when:
-	// - A profile is explicitly specified (-p flag), OR
-	// - Running as root (allows sudo ./boxit to use default profile filtering)
-	// The built-in transparent proxy handles HTTPS filtering.
-	useProxy := prof.NeedsProxy() && (*profileName != "" || os.Geteuid() == 0)
-
-	if useProxy {
-		err = runWithProxy(cwd, args, prof)
+	if prof.NeedsProxy() {
+		if os.Geteuid() == 0 {
+			// Root: transparent proxy via pf + temp user (catches all HTTP/HTTPS)
+			err = runWithProxy(cwd, args, prof)
+		} else {
+			// Non-root: explicit proxy via env vars (best-effort)
+			err = runWithExplicitProxy(cwd, args, prof)
+		}
 	} else {
 		err = sandbox.Run(cwd, args)
 	}

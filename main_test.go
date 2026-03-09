@@ -3,11 +3,15 @@
 package main
 
 import (
+	"encoding/json"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 var boxitBin string
@@ -24,6 +28,12 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		panic("failed to build boxit: " + string(out))
 	}
+
+	// Make sure we kill any test-spawned daemons after the run.
+	defer func() {
+		// Use pkill to stop any background daemons we might have started
+		exec.Command("pkill", "-f", "boxit daemon").Run()
+	}()
 
 	os.Exit(m.Run())
 }
@@ -42,6 +52,94 @@ func TestNoArgs(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "Usage") {
 		t.Fatalf("expected 'Usage' in stderr, got: %s", out)
+	}
+}
+
+func TestDaemonAllocation(t *testing.T) {
+	skipUnlessProxyCapable(t)
+
+	// Ensure no previous daemon is running
+	exec.Command("pkill", "-f", "boxit daemon").Run()
+	os.Remove("/var/run/boxit_daemon.sock")
+	time.Sleep(100 * time.Millisecond) // Give the OS a moment to clean up
+
+	// Start the daemon in the background
+	cmd := exec.Command(boxitBin, "daemon")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setsid: true, // Run in a new session so it doesn't get killed with the test process immediately
+	}
+	err := cmd.Start()
+	if err != nil {
+		t.Fatalf("failed to start daemon: %v", err)
+	}
+
+	defer func() {
+		cmd.Process.Kill()
+		cmd.Wait()
+		os.Remove("/var/run/boxit_daemon.sock")
+	}()
+
+	// Wait for the socket to appear
+	var conn net.Conn
+	for i := 0; i < 20; i++ {
+		conn, err = net.Dial("unix", "/var/run/boxit_daemon.sock")
+		if err == nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("daemon failed to create socket: %v", err)
+	}
+	defer conn.Close()
+
+	// Ask for an allocation
+	_, err = conn.Write([]byte("ALLOC\n"))
+	if err != nil {
+		t.Fatalf("failed to write to daemon: %v", err)
+	}
+
+	// Read response
+	var rep struct {
+		Username string
+		UID      int
+		Error    string
+	}
+	if err := json.NewDecoder(conn).Decode(&rep); err != nil {
+		t.Fatalf("failed to read response from daemon: %v", err)
+	}
+
+	if rep.Error != "" {
+		t.Fatalf("daemon returned error: %s", rep.Error)
+	}
+
+	if !strings.HasPrefix(rep.Username, "_boxit_") {
+		t.Errorf("unexpected username format: %s", rep.Username)
+	}
+	if rep.UID < 400 || rep.UID > 499 {
+		t.Errorf("unexpected UID range: %d", rep.UID)
+	}
+
+	// The user should now exist
+	out, err := exec.Command("id", "-u", rep.Username).CombinedOutput()
+	if err != nil {
+		t.Errorf("user %s does not exist: %s", rep.Username, out)
+	}
+
+	// Close connection; daemon should automatically delete the user
+	conn.Close()
+
+	// Poll for the daemon to clean up the user (dscl can be slow)
+	var deleted bool
+	for i := 0; i < 30; i++ {
+		time.Sleep(200 * time.Millisecond)
+		if _, err := exec.Command("id", "-u", rep.Username).CombinedOutput(); err != nil {
+			deleted = true
+			break
+		}
+	}
+	if !deleted {
+		t.Errorf("expected user %s to be deleted, but it still exists", rep.Username)
 	}
 }
 
@@ -143,19 +241,54 @@ func TestHTTPSAllowed(t *testing.T) {
 	}
 }
 
-// --- Proxy mode integration tests (require root) ---
+// --- Explicit proxy tests (non-root, uses http_proxy/https_proxy env vars) ---
 
-func skipUnlessProxyCapable(t *testing.T) {
+func skipUnlessCurl(t *testing.T) {
 	t.Helper()
-	if os.Geteuid() != 0 {
-		t.Skip("proxy tests require root (run with sudo)")
-	}
 	if _, err := exec.LookPath("curl"); err != nil {
 		t.Skip("curl not found")
 	}
 }
 
-func TestProxyBlocksPOST(t *testing.T) {
+func TestExplicitProxyBlocksPOST(t *testing.T) {
+	skipUnlessCurl(t)
+	cmd := exec.Command(boxitBin, "curl", "-sf", "-X", "POST", "https://httpbin.org/post")
+	cmd.Dir = t.TempDir()
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatal("expected POST to be blocked by default profile")
+	}
+	if !strings.Contains(string(out), "403") && !strings.Contains(string(out), "not allowed") {
+		t.Logf("output: %s", out)
+	}
+}
+
+func TestExplicitProxyAllowsGET(t *testing.T) {
+	skipUnlessCurl(t)
+	cmd := exec.Command(boxitBin, "curl", "-sf", "https://example.com")
+	cmd.Dir = t.TempDir()
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("expected GET to be allowed: %v\n%s", err, out)
+	}
+}
+
+// --- Transparent proxy integration tests (require root for pf + temp user) ---
+
+func skipUnlessRoot(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() != 0 {
+		t.Skip("requires root (run with sudo)")
+	}
+}
+
+func skipUnlessProxyCapable(t *testing.T) {
+	t.Helper()
+	skipUnlessRoot(t)
+	skipUnlessCurl(t)
+}
+
+func TestTransparentProxyBlocksPOST(t *testing.T) {
 	skipUnlessProxyCapable(t)
 	cmd := exec.Command(boxitBin, "curl", "-sf", "-X", "POST", "https://httpbin.org/post")
 	cmd.Dir = t.TempDir()
@@ -168,7 +301,7 @@ func TestProxyBlocksPOST(t *testing.T) {
 	}
 }
 
-func TestProxyAllowsGET(t *testing.T) {
+func TestTransparentProxyAllowsGET(t *testing.T) {
 	skipUnlessProxyCapable(t)
 	cmd := exec.Command(boxitBin, "curl", "-sf", "https://example.com")
 	cmd.Dir = t.TempDir()

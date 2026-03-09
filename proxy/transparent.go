@@ -120,6 +120,12 @@ func (tp *transparentProxy) handleHTTP(conn net.Conn, defaultHost string, isTLS 
 			return
 		}
 
+		// Handle CONNECT method (explicit proxy mode for HTTPS)
+		if req.Method == "CONNECT" {
+			tp.handleCONNECT(conn, req)
+			return
+		}
+
 		host := req.Host
 		if host == "" {
 			host = defaultHost
@@ -144,6 +150,28 @@ func (tp *transparentProxy) handleHTTP(conn net.Conn, defaultHost string, isTLS 
 
 		tp.forwardRequest(conn, req, host, isTLS)
 	}
+}
+
+// handleCONNECT handles the HTTP CONNECT method used by explicit proxies for HTTPS.
+// It sends 200 Connection Established, then performs TLS interception on the tunnel.
+func (tp *transparentProxy) handleCONNECT(conn net.Conn, req *http.Request) {
+	host := req.Host
+	hostOnly := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		hostOnly = h
+	}
+
+	// Check domain before establishing tunnel
+	if reason := tp.filter.CheckDomain(hostOnly); reason != "" {
+		writeBlockResponse(conn, reason)
+		return
+	}
+
+	// Tell the client the tunnel is established
+	conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+	// Now perform TLS interception on the tunneled connection
+	tp.handleTLS(conn)
 }
 
 func (tp *transparentProxy) forwardRequest(clientConn net.Conn, req *http.Request, host string, isTLS bool) {

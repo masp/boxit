@@ -11,3 +11,7 @@ import (
 func runWithProxy(cwd string, args []string, prof *profile.Profile) error {
 	return errors.New("HTTPS proxy filtering is only supported on macOS")
 }
+
+func runWithExplicitProxy(cwd string, args []string, prof *profile.Profile) error {
+	return errors.New("HTTPS proxy filtering is only supported on macOS")
+}

@@ -52,12 +52,13 @@ func runWithProxy(cwd string, args []string, prof *profile.Profile) error {
 		return err
 	}
 
-	// 3. Create temp dir for cert bundle
+	// 3. Create temp dir for cert bundle (world-readable so the temp user can access it)
 	tmpDir, err := os.MkdirTemp("", "boxit-run-")
 	if err != nil {
 		cleanup()
 		return err
 	}
+	os.Chmod(tmpDir, 0755)
 	cleanups = append(cleanups, func() error { return os.RemoveAll(tmpDir) })
 
 	// 4. Start proxy
@@ -89,6 +90,68 @@ func runWithProxy(cwd string, args []string, prof *profile.Profile) error {
 		Args:     args,
 		RunAsUID: tempUser.UID,
 		ExtraEnv: proxy.CertEnvVars(certBundle),
+	})
+
+	cleanup()
+	return err
+}
+
+// runWithExplicitProxy runs the command in a sandbox with an explicit HTTP proxy.
+// This does not require root — it uses http_proxy/https_proxy env vars instead of
+// pf-based transparent interception. Tools that ignore proxy env vars will bypass
+// the proxy.
+func runWithExplicitProxy(cwd string, args []string, prof *profile.Profile) error {
+	fmt.Fprintln(os.Stderr, "boxit: running without root — using explicit proxy (http_proxy/https_proxy).")
+	fmt.Fprintln(os.Stderr, "boxit: not all tools honor proxy env vars. Run with sudo for full HTTP interception.")
+
+	// Cleanup stack
+	var cleanups []func() error
+	cleanup := func() {
+		for i := len(cleanups) - 1; i >= 0; i-- {
+			if err := cleanups[i](); err != nil {
+				fmt.Fprintf(os.Stderr, "boxit: cleanup: %v\n", err)
+			}
+		}
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		cleanup()
+		os.Exit(130)
+	}()
+
+	// 1. Create temp dir for cert bundle
+	tmpDir, err := os.MkdirTemp("", "boxit-run-")
+	if err != nil {
+		return err
+	}
+	cleanups = append(cleanups, func() error { return os.RemoveAll(tmpDir) })
+
+	// 2. Start proxy
+	p, err := proxy.Start(prof)
+	if err != nil {
+		cleanup()
+		return err
+	}
+	cleanups = append(cleanups, p.Stop)
+
+	// 3. Build cert bundle
+	certBundle, err := proxy.BuildCertBundle(p.ConfDir, tmpDir)
+	if err != nil {
+		cleanup()
+		return err
+	}
+
+	// 4. Run sandboxed command with proxy env vars
+	envVars := proxy.CertEnvVars(certBundle)
+	envVars = append(envVars, proxy.ProxyEnvVars(p.Port)...)
+
+	err = sandbox.RunWithOptions(sandbox.Options{
+		CWD:      cwd,
+		Args:     args,
+		ExtraEnv: envVars,
 	})
 
 	cleanup()
