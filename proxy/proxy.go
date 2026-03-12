@@ -1,9 +1,10 @@
-//go:build darwin
+//go:build darwin || linux
 
 package proxy
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -62,14 +63,25 @@ func Start(prof *profile.Profile) (*Proxy, error) {
 	}, nil
 }
 
+// RequestLog returns a copy of all HTTP requests observed by the proxy.
+func (p *Proxy) RequestLog() []LogEntry {
+	if p.tp == nil {
+		return nil
+	}
+	return p.tp.requestLog()
+}
+
 // Stop shuts down the proxy and cleans up temp files.
 func (p *Proxy) Stop() error {
+	slog.Debug("proxy stopping")
 	if p.tp != nil {
 		p.tp.stop()
 	}
+	slog.Debug("proxy listener stopped, removing temp files")
 	if p.tmpDir != "" {
 		os.RemoveAll(p.tmpDir)
 	}
+	slog.Debug("proxy stop complete")
 	return nil
 }
 

@@ -4,9 +4,8 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/masp/boxit/netfilter"
 	"github.com/masp/boxit/profile"
@@ -29,15 +28,6 @@ func runWithProxy(cwd string, args []string, prof *profile.Profile) error {
 			}
 		}
 	}
-
-	// Handle signals for cleanup
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		cleanup()
-		os.Exit(130)
-	}()
 
 	// 1. Create temp user
 	tempUser, err := userutil.CreateTempUser()
@@ -100,6 +90,14 @@ func runWithProxy(cwd string, args []string, prof *profile.Profile) error {
 // This does not require root — it uses http_proxy/https_proxy env vars instead of
 // pf-based transparent interception. Tools that ignore proxy env vars will bypass
 // the proxy.
+func runNetNSChild(_ []string) error {
+	return fmt.Errorf("network namespace child is only supported on Linux")
+}
+
+func runSandboxChild(_ []string) error {
+	return fmt.Errorf("sandbox child is only supported on Linux")
+}
+
 func runWithExplicitProxy(cwd string, args []string, prof *profile.Profile) error {
 	fmt.Fprintln(os.Stderr, "boxit: running without root — using explicit proxy (http_proxy/https_proxy).")
 	fmt.Fprintln(os.Stderr, "boxit: not all tools honor proxy env vars. Run with sudo for full HTTP interception.")
@@ -107,22 +105,18 @@ func runWithExplicitProxy(cwd string, args []string, prof *profile.Profile) erro
 	// Cleanup stack
 	var cleanups []func() error
 	cleanup := func() {
+		slog.Debug("cleanup starting", "count", len(cleanups))
 		for i := len(cleanups) - 1; i >= 0; i-- {
+			slog.Debug("running cleanup", "index", len(cleanups)-i, "total", len(cleanups))
 			if err := cleanups[i](); err != nil {
 				fmt.Fprintf(os.Stderr, "boxit: cleanup: %v\n", err)
 			}
 		}
+		slog.Debug("cleanup done")
 	}
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		cleanup()
-		os.Exit(130)
-	}()
-
 	// 1. Create temp dir for cert bundle
+	slog.Debug("creating temp dir")
 	tmpDir, err := os.MkdirTemp("", "boxit-run-")
 	if err != nil {
 		return err
@@ -130,29 +124,35 @@ func runWithExplicitProxy(cwd string, args []string, prof *profile.Profile) erro
 	cleanups = append(cleanups, func() error { return os.RemoveAll(tmpDir) })
 
 	// 2. Start proxy
+	slog.Debug("starting proxy")
 	p, err := proxy.Start(prof)
 	if err != nil {
 		cleanup()
 		return err
 	}
+	slog.Debug("proxy started", "port", p.Port)
 	cleanups = append(cleanups, p.Stop)
 
 	// 3. Build cert bundle
+	slog.Debug("building cert bundle")
 	certBundle, err := proxy.BuildCertBundle(p.ConfDir, tmpDir)
 	if err != nil {
 		cleanup()
 		return err
 	}
+	slog.Debug("cert bundle ready", "path", certBundle)
 
 	// 4. Run sandboxed command with proxy env vars
 	envVars := proxy.CertEnvVars(certBundle)
 	envVars = append(envVars, proxy.ProxyEnvVars(p.Port)...)
+	slog.Debug("launching sandbox", "args", args, "envCount", len(envVars))
 
 	err = sandbox.RunWithOptions(sandbox.Options{
 		CWD:      cwd,
 		Args:     args,
 		ExtraEnv: envVars,
 	})
+	slog.Debug("sandbox exited", "err", err)
 
 	cleanup()
 	return err

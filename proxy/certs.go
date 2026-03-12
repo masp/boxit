@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build darwin || linux
 
 package proxy
 
@@ -8,13 +8,11 @@ import (
 	"path/filepath"
 )
 
-const systemCertBundle = "/etc/ssl/cert.pem"
-
 // BuildCertBundle creates a combined cert bundle by concatenating the system
 // CA certificates with the proxy CA certificate. Returns the path to
 // the combined bundle file.
 func BuildCertBundle(confDir, tmpDir string) (string, error) {
-	systemCerts, err := os.ReadFile(systemCertBundle)
+	systemCerts, err := os.ReadFile(systemCertBundlePath())
 	if err != nil {
 		return "", fmt.Errorf("proxy: read system certs: %w", err)
 	}
@@ -37,12 +35,16 @@ func BuildCertBundle(confDir, tmpDir string) (string, error) {
 }
 
 // CertEnvVars returns environment variables that configure common tools
-// to trust the combined cert bundle.
+// to trust the combined cert bundle containing system CAs + boxit proxy CA.
+//
+// Only sets env vars that are additive or scoped to specific tools.
+// We do NOT set SSL_CERT_FILE or REQUESTS_CA_BUNDLE because they replace
+// the system CA store for ALL tools, breaking TLS for tools that bypass
+// the proxy (e.g. Rust binaries like Codex). For those tools, run
+// "boxit trust" to install the CA in the system keychain instead.
 func CertEnvVars(bundlePath string) []string {
 	return []string{
-		"SSL_CERT_FILE=" + bundlePath,
-		"REQUESTS_CA_BUNDLE=" + bundlePath,
-		"NODE_EXTRA_CA_CERTS=" + bundlePath,
-		"GIT_SSL_CAINFO=" + bundlePath,
+		"NODE_EXTRA_CA_CERTS=" + bundlePath, // additive for Node.js/Bun
+		"GIT_SSL_CAINFO=" + bundlePath,      // git only
 	}
 }

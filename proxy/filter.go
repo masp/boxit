@@ -6,11 +6,18 @@ import (
 	"github.com/masp/boxit/profile"
 )
 
+// domainMethods holds the parsed, uppercased method set for a domain pattern.
+type domainMethods struct {
+	pattern string
+	methods map[string]bool
+}
+
 // Filter checks HTTP method and domain against profile rules.
 type Filter struct {
-	allowedMethods map[string]bool
-	allowedDomains []string // nil = all allowed
+	allowedMethods map[string]bool   // globally allowed methods
+	allowedDomains []string          // nil = all domains allowed
 	denyDomains    []string
+	domainRules    []domainMethods   // per-domain method overrides
 }
 
 // NewFilter builds a Filter from a profile.
@@ -23,24 +30,45 @@ func NewFilter(prof *profile.Profile) *Filter {
 	for _, method := range methods {
 		m[strings.ToUpper(method)] = true
 	}
+
+	var rules []domainMethods
+	for _, r := range prof.DomainRules {
+		dm := domainMethods{
+			pattern: r.Domain,
+			methods: make(map[string]bool, len(r.Methods)),
+		}
+		for _, method := range r.Methods {
+			dm.methods[strings.ToUpper(method)] = true
+		}
+		rules = append(rules, dm)
+	}
+
 	return &Filter{
 		allowedMethods: m,
 		allowedDomains: prof.AllowedDomains,
 		denyDomains:    prof.DenyDomains,
+		domainRules:    rules,
 	}
 }
 
-// CheckMethod returns a block reason if the method is not allowed, or "" if allowed.
-func (f *Filter) CheckMethod(method string) string {
+// CheckMethod returns a block reason if the method is not allowed for the given host,
+// or "" if allowed.
+func (f *Filter) CheckMethod(method, host string) string {
 	method = strings.ToUpper(method)
+
+	// Globally allowed methods pass unconditionally.
 	if f.allowedMethods[method] {
 		return ""
 	}
-	allowed := make([]string, 0, len(f.allowedMethods))
-	for m := range f.allowedMethods {
-		allowed = append(allowed, m)
+
+	// Check per-domain rules.
+	for _, rule := range f.domainRules {
+		if domainMatches(host, rule.pattern) && rule.methods[method] {
+			return ""
+		}
 	}
-	return "boxit: HTTP method " + method + " is not allowed. Allowed methods: " + strings.Join(allowed, ", ")
+
+	return "boxit: HTTP method " + method + " to " + host + " is not allowed"
 }
 
 // CheckDomain returns a block reason if the domain is blocked, or "" if allowed.
@@ -65,7 +93,12 @@ func (f *Filter) CheckDomain(host string) string {
 	return ""
 }
 
-// domainMatches checks if host matches a domain pattern (exact or suffix match).
+// domainMatches checks if host matches a domain pattern.
+// It matches exactly or as a subdomain suffix:
+//
+//	domainMatches("api.anthropic.com", "anthropic.com")  → true
+//	domainMatches("anthropic.com", "anthropic.com")      → true
+//	domainMatches("notanthropic.com", "anthropic.com")   → false
 func domainMatches(host, pattern string) bool {
 	host = strings.ToLower(strings.TrimRight(host, "."))
 	pattern = strings.ToLower(strings.TrimRight(pattern, "."))

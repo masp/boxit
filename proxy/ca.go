@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build darwin || linux
 
 package proxy
 
@@ -31,8 +31,115 @@ type certCache struct {
 	certs map[string]*tls.Certificate
 }
 
-// NewCA generates a self-signed ECDSA P-256 CA and writes boxit-ca-cert.pem to confDir.
+// CADir returns the persistent CA directory (~/.boxit/).
+func CADir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("proxy: %w", err)
+	}
+	return filepath.Join(home, ".boxit"), nil
+}
+
+// CACertPath returns the path to the persistent CA certificate.
+func CACertPath() (string, error) {
+	dir, err := CADir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "ca-cert.pem"), nil
+}
+
+// NewCA loads the persistent CA from ~/.boxit/ or generates a new one if missing/expired.
+// The CA cert is also written to confDir for cert bundle building.
 func NewCA(confDir string) (*CA, error) {
+	caDir, err := CADir()
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(caDir, 0700); err != nil {
+		return nil, fmt.Errorf("proxy: create CA dir: %w", err)
+	}
+
+	certPath := filepath.Join(caDir, "ca-cert.pem")
+	keyPath := filepath.Join(caDir, "ca-key.pem")
+
+	// Try loading existing CA
+	ca, err := loadCA(certPath, keyPath)
+	if err == nil {
+		// Copy cert to confDir for bundle building
+		confCertPath := filepath.Join(confDir, "boxit-ca-cert.pem")
+		if err := os.WriteFile(confCertPath, ca.certPEM, 0644); err != nil {
+			return nil, fmt.Errorf("proxy: write CA cert to confdir: %w", err)
+		}
+		return ca, nil
+	}
+
+	// Generate new CA
+	ca, err = generateCA()
+	if err != nil {
+		return nil, err
+	}
+
+	// Persist to ~/.boxit/
+	if err := os.WriteFile(certPath, ca.certPEM, 0644); err != nil {
+		return nil, fmt.Errorf("proxy: write CA cert: %w", err)
+	}
+	keyPEM, err := marshalECKey(ca.key)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
+		return nil, fmt.Errorf("proxy: write CA key: %w", err)
+	}
+
+	// Copy cert to confDir for bundle building
+	confCertPath := filepath.Join(confDir, "boxit-ca-cert.pem")
+	if err := os.WriteFile(confCertPath, ca.certPEM, 0644); err != nil {
+		return nil, fmt.Errorf("proxy: write CA cert to confdir: %w", err)
+	}
+
+	return ca, nil
+}
+
+// loadCA loads a CA from PEM files, returning an error if missing or expired.
+func loadCA(certPath, keyPath string) (*CA, error) {
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return nil, err
+	}
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, err
+	}
+
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		return nil, fmt.Errorf("proxy: invalid CA cert PEM")
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if expired (with 1 hour buffer)
+	if time.Now().Add(1 * time.Hour).After(cert.NotAfter) {
+		return nil, fmt.Errorf("proxy: CA cert expired")
+	}
+
+	keyBlock, _ := pem.Decode(keyPEM)
+	if keyBlock == nil {
+		return nil, fmt.Errorf("proxy: invalid CA key PEM")
+	}
+	key, err := x509.ParseECPrivateKey(keyBlock.Bytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return &CA{cert: cert, key: key, certPEM: certPEM}, nil
+}
+
+// generateCA creates a new self-signed ECDSA P-256 CA with 1 year validity.
+func generateCA() (*CA, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, fmt.Errorf("proxy: generate CA key: %w", err)
@@ -51,7 +158,7 @@ func NewCA(confDir string) (*CA, error) {
 			Organization: []string{"Boxit"},
 		},
 		NotBefore:             now,
-		NotAfter:              now.Add(24 * time.Hour),
+		NotAfter:              now.Add(365 * 24 * time.Hour),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
@@ -71,13 +178,15 @@ func NewCA(confDir string) (*CA, error) {
 
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 
-	// Write CA cert to confDir
-	certPath := filepath.Join(confDir, "boxit-ca-cert.pem")
-	if err := os.WriteFile(certPath, certPEM, 0644); err != nil {
-		return nil, fmt.Errorf("proxy: write CA cert: %w", err)
-	}
-
 	return &CA{cert: cert, key: key, certPEM: certPEM}, nil
+}
+
+func marshalECKey(key *ecdsa.PrivateKey) ([]byte, error) {
+	der, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("proxy: marshal CA key: %w", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: der}), nil
 }
 
 // MintCert generates a leaf certificate for the given hostname, signed by this CA.
